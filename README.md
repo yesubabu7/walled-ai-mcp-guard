@@ -1,161 +1,358 @@
-# Walled AI MCP Guard
+# MCP Guard
 
-A Python proxy that sits between an MCP client (Claude Desktop) and real MCP servers,
-monitors every message, and (in later steps) asks the user to Allow or Block each tool call.
+**A Python firewall for the Model Context Protocol.** MCP Guard sits between Claude (Desktop and Web)
+and your MCP servers. It holds every tool call in an always-on-top popup until you click **Allow** or **Block**.
 
-> Work in progress: **Steps 1–5 done** (transparent proxy, `tools/call` interception, Tkinter Allow/Block popup).
+![Allow/Block popups for three simultaneous tool calls](docs/popups.png)
 
-## Approval popup (Step 5)
+> **Demo video:** _add link here_ · Built for the Walled AI take-home assignment.
+
+---
+
+## Contents
+
+1. [What it does](#what-it-does)
+2. [Architecture](#architecture)
+3. [How interception works](#how-interception-works)
+4. [Design decisions](#design-decisions)
+5. [Installation](#installation)
+6. [Using it with Claude Desktop](#using-it-with-claude-desktop)
+7. [Using it with Claude Web](#using-it-with-claude-web)
+8. [Configuration reference](#configuration-reference)
+9. [Security and reliability](#security-and-reliability)
+10. [Testing](#testing)
+11. [Project layout](#project-layout)
+12. [Limitations and future work](#limitations-and-future-work)
+
+---
+
+## What it does
+
+| Requirement | How MCP Guard does it |
+|---|---|
+| Monitor MCP requests from Claude Desktop and Claude Web | Every JSON-RPC message is parsed and logged. Tool calls are captured with server, tool name, request id and arguments |
+| Confirmation popup on top of other windows | One always-on-top Tkinter window per pending call, showing the server, tool, id and pretty-printed arguments |
+| Allow / Block | **Allow** forwards the original request unchanged. **Block** returns an MCP tool error (`isError: true`), and the server never sees the call |
+| Keep requests pending until the user decides | Each call waits in its own asyncio task. Other traffic and further calls keep flowing |
+| Multiple simultaneous requests | Independent popups, answered in any order and matched back by JSON-RPC id |
+| Background operation | Launched automatically by Claude Desktop. A system-tray shield shows the status (green = idle, amber = pending) |
+| Termination, failures, errors | Fails closed: timeout, crash, closing the window or shutdown all mean **Block** |
+
+Verified end to end in **real Claude Desktop** (Windows, Microsoft Store build) and **real claude.ai** (custom
+connector through a Cloudflare tunnel), using the official `@modelcontextprotocol/server-filesystem` server.
+
+---
+
+## Architecture
+
+MCP Guard has one interception core and two front ends, one for each Claude client:
 
 ```
-main thread:   Tk mainloop ── TkinterApprover ── one always-on-top ApprovalPopup per pending call
-                    ▲  polls every 50 ms                 │ Allow / Block / X
-                    │                                    ▼
-               ApprovalBridge (thread-safe queue + loop.call_soon_threadsafe)
-                    ▲                                    │
-proxy thread:  asyncio loop ── StdioProxy ── await approver.decide(request)
+                     ┌──────────────────────────── MCP Guard (Python) ─────────────────────────────┐
+Claude Desktop ─stdio─▶ app/main.py ──┐                                                               │
+                     │                ▼                                                               │
+                     │          StdioProxy (app/proxy.py) ── tools/call? ── Approver.decide() ──┐    │
+                     │                ▲      everything else: forward                          │    │
+Claude Web ─HTTPS─▶ tunnel ─▶ McpGateway (app/gateway.py)                                       ▼    │
+                     │        one session = one StdioProxy                     TkinterApprover popup  │
+                     │                                                         + tray icon           │
+                     └───────────────────────────────┬────────────────────────────────────────────────┘
+                                                     │ stdio (approved calls only)
+                                                     ▼
+                                    real MCP server, e.g. filesystem (sandbox only)
 ```
 
-- Tk must own the main thread, so in popup mode the asyncio proxy runs on a worker thread.
-- Each pending `tools/call` gets its own popup showing server, tool, request id, and pretty-printed arguments, plus a countdown to the automatic block.
-- Each popup has Allow and Block buttons. Closing the window (X) or pressing Escape counts as **Block**. Keyboard focus starts on Block.
-- When the proxy's timeout expires, or the client cancels the call, the popup is withdrawn. On shutdown, every open popup resolves as Block.
+### Why two front ends?
 
-**Tray icon (background operation).** In popup mode, MCP Guard shows a system-tray shield. It is **green** when
-idle and **amber** while calls wait for a decision; the tooltip shows the pending count. Its menu has *Show pending
-popups*, *Open log*, and *Quit MCP Guard* (which blocks any pending calls). On Windows 11, new tray icons start
-in the `^` overflow area, and you can drag the shield onto the taskbar. Use `--no-tray` to disable it. If
-`pystray`/`Pillow` aren't installed, MCP Guard logs a warning and runs without the tray.
+- **Claude Desktop** launches local MCP servers itself and talks to them over **stdio**: newline-delimited
+  JSON-RPC 2.0 on stdin/stdout. We register MCP Guard in `claude_desktop_config.json` *in place of* the real
+  server. Claude launches MCP Guard, and MCP Guard launches the real server. That's a man-in-the-middle by
+  configuration, with no packet sniffing or code injection.
+- **Claude Web** can't launch programs. It only connects to **remote** MCP servers over HTTPS ("custom
+  connectors"), and the requests come from Anthropic's cloud. So MCP Guard also serves MCP's
+  **Streamable HTTP** transport (`--http`), exposed through a tunnel. Each web session gets its own guarded
+  backend, and calls go through the same popup.
 
-Try it manually (each tool call opens a popup):
+### Threads
+
+```
+main thread    Tk mainloop: TkinterApprover owns every popup window; polls a queue every 50 ms
+asyncio thread StdioProxy / McpGateway: all protocol I/O, one task per pending tool call
+stdin thread   blocking reads of Claude's stdin (asyncio can't read stdin reliably on Windows)
+tray thread    pystray's OS message loop
+```
+
+Threads never touch each other's objects. `ApprovalBridge` connects asyncio to Tk with a thread-safe
+`queue.Queue` one way and `loop.call_soon_threadsafe(future.set_result, decision)` the other way.
+
+---
+
+## How interception works
+
+```mermaid
+sequenceDiagram
+    participant C as Claude
+    participant G as MCP Guard
+    participant U as User (popup)
+    participant S as MCP server
+    C->>G: initialize / tools/list / ping
+    G->>S: forwarded immediately
+    S-->>C: responses flow back unchanged
+    C->>G: tools/call {id: 7, name: read_text_file, args}
+    Note over G: HOLD: new asyncio task,<br/>read loop keeps running
+    G->>U: popup (server, tool, id, args, countdown)
+    alt Allow
+        U-->>G: Allow
+        G->>S: original request bytes
+        S-->>C: result (matched by id 7)
+    else Block / close window / timeout
+        U-->>G: Block
+        G-->>C: {id: 7, result: {isError: true, "blocked by MCP Guard"}}
+    end
+```
+
+Key rules in `app/proxy.py`:
+
+- **Only `tools/call` is held.** `initialize`, `tools/list`, notifications and `ping` pass through untouched;
+  blocking them would just break the session.
+- **The read loop never awaits an approval**, so one open popup can't stall other requests.
+- **Allow forwards the original bytes**, so nothing is re-serialized or altered.
+- **Block answers the client directly.** The server never sees the request. The reply is a normal tool result
+  with `isError: true`, as the MCP spec defines for tool-execution errors, so the model can read it and explain it.
+- **Cancellation:** `notifications/cancelled` for a held call cancels its task and closes its popup, and no
+  response is sent, as the spec requires.
+
+---
+
+## Design decisions
+
+| Decision | Why |
+|---|---|
+| Proxy rather than sniffing | stdio is a private pipe between two processes, with no network traffic to capture. Being the process Claude launches is the only reliable interception point |
+| Intercept only `tools/call` | That's where side effects happen. Everything else is session setup and discovery |
+| Pluggable `Approver` interface | The proxy only calls `await approver.decide(request)`. Popup, console and policy approvers are swappable, and tests use the policy approver |
+| One asyncio task per call | The work is I/O-bound (pipes plus a human). Tasks are cheap, and writes to Claude are a single write+flush, so messages can't interleave |
+| Tk on the main thread | Tk must stay on the thread that created it. The asyncio side moves to a worker thread instead |
+| No MCP SDK | The proxy only needs JSON-RPC framing and a few MCP methods. It doesn't implement a server |
+| Fail closed everywhere | A missing decision must never become an implicit Allow |
+
+---
+
+## Installation
+
+Requirements: **Python 3.10+** (tested with 3.14), **Node.js 18+** (for the filesystem MCP server via `npx`),
+and Windows 10/11 (also works on macOS/Linux with a desktop for the popup).
 
 ```bash
-python scripts/test_client.py demo
-python scripts/concurrent_demo.py
+git clone https://github.com/yesubabu7/walled-ai-mcp-guard.git
+cd walled-ai-mcp-guard
+python -m venv .venv
+.venv\Scripts\activate            # macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt   # aiohttp (web gateway), pystray + Pillow (tray icon)
 ```
 
-## Interception (Step 4)
+The filesystem server may only access `sandbox/`, which ships with a sample `notes.txt`. For a Block demo,
+add a dummy secrets file, e.g. `sandbox/.env` (gitignored).
 
-- Only `tools/call` requests are held. Everything else (`initialize`, `tools/list`, notifications, `ping`, ...) is forwarded immediately.
-- Each held call gets its own asyncio task that awaits `Approver.decide()`. The read loop never waits, so other traffic and further tool calls keep flowing.
-- **Allow:** the original request bytes are forwarded unchanged. The backend's response is matched to the request by its JSON-RPC id.
-- **Block:** the backend never sees the request. The client receives a tool error result (`isError: true`) explaining that the call was blocked.
-- **Fails closed:** approval timeouts, approver crashes, unparseable lines, and batches containing `tools/call` are all blocked or rejected.
-- If the client sends `notifications/cancelled` for a pending call, the proxy drops it without sending a response.
+Quick check without Claude (each call opens a popup):
 
-Approvers (`--approver`):
-- `popup` (default): Tkinter popup (`app/tk_approver.py`).
-- `console`: Allow/Block prompt in the terminal window (`app/approval.py`).
-- `--approver policy --allow echo --block add --default block`: static rules, used by the tests.
+```bash
+python scripts/test_client.py demo        # one session: initialize, tools/list, two tool calls
+python scripts/concurrent_demo.py         # three simultaneous calls + a ping answered instantly
+```
 
-## Claude Desktop integration (Windows)
+---
 
-Claude Desktop launches every entry under `mcpServers` in `claude_desktop_config.json` as a child process
-and talks MCP over its stdin/stdout. We register MCP Guard there instead of the filesystem server. MCP Guard
-then starts the real server itself, from the `filesystem` entry in `config/servers.json`.
+## Using it with Claude Desktop
 
-Config file location:
+**1. Install the entry.** `scripts/claude_config.py` finds Claude Desktop's config file, **backs it up** to
+`backups/` (which is gitignored), and adds or removes **only** its own `mcpServers` entry. All other settings are
+kept. Quit Claude Desktop completely (tray icon → Quit) first, because it rewrites this file while running.
+
+```bash
+python scripts/claude_config.py show        # dry run: prints current and proposed mcpServers
+python scripts/claude_config.py install     # backup + add "filesystem-guarded"
+```
+
+The entry it adds:
+
+```json
+"mcpServers": {
+  "filesystem-guarded": {
+    "command": "C:\\path\\to\\walled-ai-mcp-guard\\.venv\\Scripts\\python.exe",
+    "args": ["C:\\path\\to\\walled-ai-mcp-guard\\app\\main.py", "--server", "filesystem"]
+  }
+}
+```
+
+**2. Restart Claude Desktop.** Ask something like *"Using filesystem-guarded, read
+`<repo>\sandbox\notes.txt`"*. A popup appears; Allow or Block.
+
+**Config file location** (the script checks all of these):
 
 | Install type | Path |
 |---|---|
-| Microsoft Store (MSIX), newer builds | `%LOCALAPPDATA%\Claude-Data\claude_<id>\claude_desktop_config.json` |
-| Microsoft Store (MSIX), older builds | `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json` |
-| Classic installer | `%APPDATA%\Claude\claude_desktop_config.json` |
+| Microsoft Store, newer builds | `%LOCALAPPDATA%\Claude-Data\claude_<id>\claude_desktop_config.json` |
+| Microsoft Store, older builds | `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json` |
+| Classic installer / macOS | `%APPDATA%\Claude\…` / `~/Library/Application Support/Claude/…` |
 
-`scripts/claude_config.py` finds the file, backs it up to `backups/` before every write, and only touches its own entry:
+**To remove it:** `python scripts/claude_config.py uninstall` removes only our entry. `restore` puts back the newest
+backup; prefer `uninstall`, because a restore also rolls back any Claude preferences that changed since the backup.
 
-```bash
-python scripts/claude_config.py show        # dry run
-python scripts/claude_config.py install     # quit Claude Desktop first, then reopen it
-python scripts/claude_config.py uninstall   # remove only the MCP Guard entry
-python scripts/claude_config.py restore     # put the newest backup back (or --from <file>)
-```
+---
 
-**Pinning the server's directories (MCP Roots).** Clients that support MCP Roots, such as Claude Desktop's Code
-sessions, send their own working folder. The filesystem server then *replaces* its command-line directories with
-it, so the client can widen what the server may access. Backends marked `"ignore_client_roots": true` in
-`config/servers.json` are protected from this. MCP Guard removes the `roots` capability from `initialize` and drops
-`notifications/roots/list_changed`, so the server keeps its configured `sandbox`.
-
-Prefer `uninstall` over `restore` for rollback. Claude Desktop keeps its preferences in the same file, so
-restoring an old backup also rolls those preferences back.
-
-## Claude Web integration (HTTP gateway)
-
-Claude Web can't launch local programs. It only connects to **remote** MCP servers over HTTPS ("custom
-connectors"), and those requests come from Anthropic's cloud. So MCP Guard has a second front end: a
-**Streamable HTTP gateway** that reuses the same interception, approvers, and popup.
-
-```
-Claude Web ──HTTPS──▶ Cloudflare tunnel ──▶ MCP Guard gateway (127.0.0.1:8765, app/gateway.py)
-                                                 │ one session = one guarded backend process
-                                                 ▼
-                                    StdioProxy (same tools/call interception + popup)
-                                                 ▼
-                                    filesystem MCP server (sandbox only)
-```
-
-- `POST /mcp/<token>` carries one JSON-RPC message. Requests get an SSE stream with the response. While a call waits for the popup, keep-alive comments are sent every 15 s. Notifications get `202`.
-- `initialize` creates a session (`Mcp-Session-Id` header). `DELETE` ends it. Idle sessions are cleaned up after 30 min.
-- **Security:**
-  - **Token:** a secret token in the URL path is the credential (compared in constant time; a wrong token gets 404).
-  - **Local only:** the gateway listens on `127.0.0.1` only, so the tunnel is the only way in.
-  - **Origin check:** requests with a foreign browser `Origin` header are rejected.
-- If Claude Web disconnects while a call is pending, the call is cancelled and its popup closes.
-
-Run it:
+## Using it with Claude Web
 
 ```bash
 python app/main.py --server filesystem --http --port 8765
-# -> logs "Claude Web connector URL: https://<your-tunnel-host>/mcp/<token>"
-#    (token is generated once and kept in config/gateway_token.txt, which is gitignored)
+#   logs: Claude Web connector URL: https://<your-tunnel-host>/mcp/<token>
+#   (the token is generated once and stored in config/gateway_token.txt, which is gitignored)
 
-winget install --id Cloudflare.cloudflared       # once
-cloudflared tunnel --url http://127.0.0.1:8765   # prints https://<random>.trycloudflare.com
+winget install --id Cloudflare.cloudflared         # once (or ngrok, or any HTTPS tunnel)
+cloudflared tunnel --url http://127.0.0.1:8765     # prints https://<random>.trycloudflare.com
 ```
 
-In claude.ai, go to **Settings → Connectors → Add custom connector**. Enter the URL
-`https://<random>.trycloudflare.com/mcp/<token>`, then enable the connector in a chat.
+In claude.ai, go to **Settings → Connectors → Add custom connector**. Use the URL
+`https://<random>.trycloudflare.com/mcp/<token>` and leave the OAuth fields empty. Then turn the connector on in a
+chat (the **+** menu → Connectors). claude.ai has its own tool-permission prompt; MCP Guard's popup is an
+**independent** second layer that works even if the client-side prompt is turned off.
 
-To test without Claude Web: `python scripts/http_client.py http://127.0.0.1:8765/mcp/<token> read_text_file "{\"path\": \"notes.txt\"}"`
+Test the gateway without claude.ai:
+`python scripts/http_client.py http://127.0.0.1:8765/mcp/<token> read_text_file "{\"path\": \"notes.txt\"}"`
 
-**Limitations:**
-- There is no server-to-client GET stream (the spec allows this). Server-initiated notifications such as `tools/list_changed` are dropped.
-- Quick tunnels get a new hostname on every restart; a named Cloudflare tunnel keeps it stable.
+### Gateway protocol details (MCP Streamable HTTP, spec 2025-06-18)
 
-## Tests
+- `POST /mcp/<token>` carries one JSON-RPC message.
+  - **Requests** get a `text/event-stream` response with the result. While a popup is open, an SSE keep-alive
+    comment is sent every 15 s so proxies and clients don't time out.
+  - **Notifications** get `202`.
+- `initialize` creates a session and returns its id in the `Mcp-Session-Id` header. An unknown session id gets
+  `404`, which tells the client to start a new session.
+- `DELETE` ends a session. Idle sessions are cleaned up after 30 min. `GET` returns `405`, since the
+  server-to-client stream is optional.
+- Every request is logged with the token **redacted** (`HTTP POST /mcp/<token> -> 200 (ua=Claude-User)`).
+
+---
+
+## Configuration reference
+
+`config/servers.json` defines the backends MCP Guard can launch. `{python}` and `{root}` are replaced with
+the current interpreter and the project folder.
+
+```json
+"filesystem": {
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem", "{root}/sandbox"],
+  "ignore_client_roots": true
+}
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--server NAME` | required | Backend from `servers.json` |
+| `--approver popup\|console\|policy` | `popup` | Tkinter popup, terminal prompt, or static rules (`--allow`, `--block`, `--default`) |
+| `--approval-timeout SEC` | `300` | Undecided calls are **blocked** after this many seconds |
+| `--no-tray` | off | Hide the tray icon |
+| `--http --port --host --token --allow-origin` | | Claude Web gateway options |
+| `ignore_client_roots` (servers.json) | `false` | Stop clients from changing the server's allowed directories (see below) |
+
+To guard another server (GitHub, a database…), add it to `servers.json` and register a second Claude Desktop
+entry with `--server <name>`.
+
+---
+
+## Security and reliability
+
+**Fails closed:** an Allow only happens on an explicit click.
+
+| Situation | Result |
+|---|---|
+| Block button, closing the window, Escape | Block (keyboard focus starts on Block) |
+| No decision within `--approval-timeout` | Block, and the popup closes |
+| Approver crashes, or no display available | Block, or MCP Guard refuses to start; it never falls back to allowing |
+| MCP Guard quits (tray menu, Ctrl+C) with calls pending | All pending calls are blocked |
+
+**Requests can't sneak past:**
+
+- **Unparseable lines** are rejected, never forwarded, because they might hide a tool call.
+- **JSON-RPC batches** containing `tools/call` are rejected.
+- **A `tools/call` sent as a notification** (no id) is dropped.
+- **Duplicate pending ids** are rejected. Numeric `7` and string `"7"` are tracked separately.
+
+**MCP Roots pinning (a real issue found during testing):** Claude Desktop's Code sessions advertise the
+*roots* capability and send their own working folder. The filesystem server then **replaced** its configured
+`sandbox` with that folder, so the client could widen the server's access. With `ignore_client_roots`, MCP Guard
+removes `roots` from the client's `initialize` and drops `notifications/roots/list_changed`, so the server keeps
+its configured directory. This was verified in Claude Desktop.
+
+**Protocol hygiene:** stdout is reserved for JSON-RPC. MCP Guard keeps the real stream for protocol messages and
+points `sys.stdout` at stderr, and non-JSON output from the backend is dropped. Logs go to `logs/proxy.log`
+and stderr (which Claude Desktop captures).
+
+**Gateway:**
+
+- **Token:** a secret URL token, compared in constant time; a wrong token gets `404`.
+- **Local only:** it binds to `127.0.0.1`, so the tunnel is the only way in.
+- **Origin check:** foreign browser `Origin`s get `403`.
+- **Isolation:** each session has its own backend process.
+- **Disconnects:** when a client disconnects, its pending call is cancelled and the popup withdrawn.
+
+**Lifecycle:** when Claude closes our stdin, MCP Guard cancels pending calls, closes the backend's stdin politely,
+waits up to 5 s, then kills it. If the backend dies, the session ends cleanly instead of hanging.
+
+---
+
+## Testing
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -v
+python -m pytest -v            # 41 tests, ~20 s
 ```
 
-## How it works (Step 1)
+| Suite | Tests | Covers |
+|---|---|---|
+| `test_interception.py` | 11 | Allow, Block, blocked by default, traffic flowing while a call waits, 3 simultaneous calls run in parallel, `7` vs `"7"`, cancellation, timeout, batches, bad JSON, clean exit with pending calls |
+| `test_tk_approver.py` | 14 | Thread bridge without a display (simultaneous calls, timeout, a late click after shutdown); real Tk popups: details shown, always on top, Allow, Block, X = Block, two popups at once, timeout, shutdown, pending count |
+| `test_gateway.py` | 11 | HTTP sessions, Allow/Block over SSE and JSON, wrong token, foreign Origin, batches, simultaneous calls, session isolation, keep-alives, disconnects, DELETE, GET 405 |
+| `test_roots.py` | 2 | Roots pinning on vs. transparent pass-through |
+| `test_tray.py` | 3 | Icon images, pending count, tooltip |
+
+The end-to-end tests start the real proxy as a separate process in front of `examples/demo_server.py`, a tiny
+MCP server whose `slow_echo` tool makes timing tests deterministic. Popup tests click the real buttons
+programmatically and are skipped when no display is available.
+
+---
+
+## Project layout
 
 ```
-Claude Desktop ──stdin/stdout──▶ app/main.py (StdioProxy) ──stdin/stdout──▶ real MCP server
-                                        │
-                                        └──▶ logs/proxy.log
+app/
+  main.py          CLI: config loading, run modes (stdio / --http), thread setup
+  proxy.py         StdioProxy: forwarding, tools/call interception, roots pinning, lifecycle
+  approval.py      Approver interface, ToolCallRequest, PolicyApprover, ConsoleApprover
+  tk_approver.py   Tkinter popups + ApprovalBridge (asyncio <-> Tk thread hand-off)
+  gateway.py       Streamable HTTP gateway for Claude Web
+  tray.py          System-tray icon
+  logger.py        File + stderr logging (never stdout)
+config/servers.json   Backend MCP servers
+scripts/
+  claude_config.py    Safe install/uninstall/restore of the Claude Desktop entry
+  test_client.py      Scripted MCP session over stdio
+  concurrent_demo.py  Simultaneous-calls demo
+  http_client.py      Scripted MCP session over HTTP (Claude Web path)
+examples/demo_server.py  Minimal MCP server used by tests
+tests/              41 pytest tests
+sandbox/notes.txt   Demo file the filesystem server may read
 ```
 
-- MCP's stdio transport is newline-delimited JSON-RPC 2.0, one message per line.
-- The proxy launches the backend server as a subprocess, forwards lines in both directions, and logs each one.
-- stdout carries protocol traffic only. Logs go to `logs/proxy.log` and stderr.
+---
 
-## Setup
+## Limitations and future work
 
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-## Try it
-
-```bash
-python scripts/test_client.py demo
-python scripts/test_client.py filesystem
-```
-
-Backends are defined in `config/servers.json`. `{python}` and `{root}` are replaced with
-the current interpreter and the project folder.
+- **Coverage:** only servers routed through MCP Guard are protected. An unguarded entry added to Claude's config
+  bypasses it. A watcher that flags unguarded entries would close this gap.
+- **No GET stream:** the HTTP gateway offers no server-to-client stream, so server-initiated notifications (e.g.
+  `tools/list_changed`) are dropped. Quick tunnels change hostname on restart; a named tunnel keeps a stable URL.
+- **Granularity:** decisions are per call. Natural next steps are "always allow this tool", argument rules (e.g.
+  block any path containing `.env`), and guarding `resources/read` as well.
+- **Logging:** a structured JSON-lines audit log of decisions, with redaction of sensitive arguments.

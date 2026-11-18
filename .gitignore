@@ -6,6 +6,8 @@ logs/*.log
 sandbox/*
 !sandbox/notes.txt
 .pytest_cache/
+# private recording notes
+DEMO_SCRIPT.md
 config/gateway_token.txt
 # Claude Desktop config backups contain account ids and device names
 backups/
