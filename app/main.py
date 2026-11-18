@@ -86,6 +86,23 @@ def run_with_popup(make_coro: Callable[[], Coroutine], request_stop: Callable[[]
     return outcome["code"]
 
 
+def start_tray(args: argparse.Namespace, approver, log):
+    """Tray icon for popup mode. Optional: MCP Guard keeps working without pystray."""
+    try:
+        from app.logger import LOG_DIR
+        from app.tray import TrayIcon
+
+        mode = "web gateway" if args.http else "Claude Desktop"
+        tray = TrayIcon(f"{args.server} ({mode})", on_show=approver.show_all, on_quit=approver.stop,
+                        log_path=LOG_DIR / "proxy.log")
+        approver.on_change = tray.set_pending
+        tray.start()
+        return tray
+    except Exception as exc:  # ImportError (pystray/Pillow missing) or no tray support
+        log.warning("tray icon unavailable (%s); continuing without it", exc)
+        return None
+
+
 def load_token(explicit: str | None) -> str:
     """Gateway credential: --token, else $MCP_GUARD_TOKEN, else a persisted random token."""
     token = explicit or os.environ.get("MCP_GUARD_TOKEN")
@@ -112,6 +129,7 @@ def main() -> int:
                         help="policy: seconds to wait before deciding (simulates a human)")
     parser.add_argument("--approval-timeout", type=float, default=DEFAULT_APPROVAL_TIMEOUT,
                         help="seconds before an undecided tool call is blocked")
+    parser.add_argument("--no-tray", action="store_true", help="popup mode: don't show a system-tray icon")
     http = parser.add_argument_group("HTTP gateway (Claude Web)")
     http.add_argument("--http", action="store_true",
                       help="serve MCP over Streamable HTTP instead of stdio")
@@ -169,7 +187,12 @@ def main() -> int:
         make_coro = service.run
 
     if args.approver == "popup":
-        return run_with_popup(make_coro, service.stop, approver, log)
+        tray = None if args.no_tray else start_tray(args, approver, log)
+        try:
+            return run_with_popup(make_coro, service.stop, approver, log)
+        finally:
+            if tray is not None:
+                tray.stop()
 
     try:
         return asyncio.run(make_coro())

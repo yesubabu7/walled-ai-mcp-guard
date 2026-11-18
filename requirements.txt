@@ -1,3 +1,6 @@
 # Core (stdio proxy, Tkinter popup) uses only the standard library.
 # HTTP gateway for Claude Web:
 aiohttp>=3.10
+# System-tray icon (optional: MCP Guard runs without it):
+pystray>=0.19
+Pillow>=10

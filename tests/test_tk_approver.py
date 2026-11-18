@@ -219,6 +219,24 @@ def test_timeout_removes_popup(approver):
     pump_until(approver, lambda: approver.popups == {})
 
 
+def test_pending_count_reported_for_tray(approver):
+    counts: list[int] = []
+    approver.on_change = counts.append
+    t1, r1 = decide_in_background(approver, make_request(1))
+    t2, r2 = decide_in_background(approver, make_request(2))
+    pump_until(approver, lambda: len(approver.popups) == 2)
+
+    approver.show_all()  # tray "Show pending popups": must not disturb anything
+    approver.pump()
+    assert len(approver.popups) == 2
+
+    for popup in list(approver.popups.values()):
+        popup.allow_button.invoke()
+    assert finish(t1, r1, approver) is Decision.ALLOW
+    assert finish(t2, r2, approver) is Decision.ALLOW
+    assert counts[-1] == 0 and max(counts) == 2
+
+
 def test_stop_blocks_all_pending_popups(approver):
     t1, r1 = decide_in_background(approver, make_request(1))
     t2, r2 = decide_in_background(approver, make_request(2))

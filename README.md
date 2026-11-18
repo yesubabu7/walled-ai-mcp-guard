@@ -21,6 +21,12 @@ proxy thread:  asyncio loop ── StdioProxy ── await approver.decide(reque
 - Each popup has Allow and Block buttons. Closing the window (X) or pressing Escape counts as **Block**. Keyboard focus starts on Block.
 - When the proxy's timeout expires, or the client cancels the call, the popup is withdrawn. On shutdown, every open popup resolves as Block.
 
+**Tray icon (background operation).** In popup mode, MCP Guard shows a system-tray shield. It is **green** when
+idle and **amber** while calls wait for a decision; the tooltip shows the pending count. Its menu has *Show pending
+popups*, *Open log*, and *Quit MCP Guard* (which blocks any pending calls). On Windows 11, new tray icons start
+in the `^` overflow area, and you can drag the shield onto the taskbar. Use `--no-tray` to disable it. If
+`pystray`/`Pillow` aren't installed, MCP Guard logs a warning and runs without the tray.
+
 Try it manually (each tool call opens a popup):
 
 ```bash

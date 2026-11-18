@@ -77,6 +77,9 @@ class ApprovalBridge:
     def shutdown(self) -> None:
         self._commands.put(("shutdown",))
 
+    def post(self, command: tuple) -> None:
+        self._commands.put(command)
+
     def drain(self) -> list[tuple]:
         commands = []
         while True:
@@ -183,6 +186,8 @@ class TkinterApprover(Approver):
         self.root.withdraw()  # hidden root; only the popups are shown
         self.popups: dict[int, ApprovalPopup] = {}
         self._stopping = False
+        # Called on the GUI thread with the number of open popups whenever it changes (tray icon).
+        self.on_change: Callable[[int], None] | None = None
 
     # ---- called from the asyncio thread ----
 
@@ -192,6 +197,10 @@ class TkinterApprover(Approver):
     def stop(self) -> None:
         """Thread-safe: close all popups (as Block) and end the GUI loop."""
         self.bridge.shutdown()
+
+    def show_all(self) -> None:
+        """Thread-safe: bring every pending popup back to the front."""
+        self.bridge.post(("show_all",))
 
     # ---- GUI thread ----
 
@@ -204,8 +213,17 @@ class TkinterApprover(Approver):
 
     def pump(self) -> None:
         """Process queued commands once (used by the poll loop and by tests)."""
+        before = len(self.popups)
         for command in self.bridge.drain():
             self._handle(command)
+        self._notify_if_changed(before)
+
+    def _notify_if_changed(self, before: int) -> None:
+        if self.on_change is not None and len(self.popups) != before:
+            try:
+                self.on_change(len(self.popups))
+            except Exception:
+                log.exception("on_change callback failed")
 
     def _poll(self) -> None:
         self.pump()
@@ -229,6 +247,12 @@ class TkinterApprover(Approver):
             if popup is not None:
                 popup.destroy()
                 log.info("popup for id=%s withdrawn (timed out or cancelled)", popup.request.request_id)
+        elif kind == "show_all":
+            for popup in self.popups.values():
+                popup.deiconify()
+                popup.lift()
+                popup.attributes("-topmost", True)
+                popup.focus_force()
         elif kind == "shutdown":
             self._stopping = True
             for popup in list(self.popups.values()):
@@ -236,8 +260,10 @@ class TkinterApprover(Approver):
             self.root.quit()
 
     def _finish(self, ticket: int, resolve: Resolver, decision: Decision) -> None:
+        before = len(self.popups)
         popup = self.popups.pop(ticket, None)
         if popup is not None:
             log.info("user chose %s for id=%s", decision.value.upper(), popup.request.request_id)
             popup.destroy()
         resolve(decision)
+        self._notify_if_changed(before)
