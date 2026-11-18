@@ -11,10 +11,13 @@ Run modes:
 import argparse
 import asyncio
 import json
+import os
+import secrets
 import signal
 import sys
 import threading
 from pathlib import Path
+from typing import Callable, Coroutine
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -27,6 +30,7 @@ from app.logger import setup_logging  # noqa: E402
 from app.proxy import DEFAULT_APPROVAL_TIMEOUT, StdioProxy  # noqa: E402
 
 DEFAULT_CONFIG = ROOT / "config" / "servers.json"
+TOKEN_FILE = ROOT / "config" / "gateway_token.txt"
 WORKER_JOIN_TIMEOUT = 15.0
 
 
@@ -54,17 +58,17 @@ def build_approver(args: argparse.Namespace) -> Approver:
     )
 
 
-def run_with_popup(proxy: StdioProxy, approver, log) -> int:
-    """Tk owns the main thread; the asyncio proxy runs on a worker thread."""
+def run_with_popup(make_coro: Callable[[], Coroutine], request_stop: Callable[[], None], approver, log) -> int:
+    """Tk owns the main thread; the asyncio side (stdio proxy or HTTP gateway) runs on a worker thread."""
     outcome = {"code": 1}
 
-    def proxy_thread() -> None:
+    def worker_thread() -> None:
         try:
-            outcome["code"] = asyncio.run(proxy.run())
+            outcome["code"] = asyncio.run(make_coro())
         except Exception:
-            log.exception("proxy crashed")
+            log.exception("MCP Guard crashed")
         finally:
-            approver.stop()  # proxy finished (client disconnected or crash): end the GUI loop
+            approver.stop()  # asyncio side finished (client disconnected or crash): end the GUI loop
 
     def on_sigint(*_args) -> None:
         log.info("interrupted")
@@ -72,14 +76,26 @@ def run_with_popup(proxy: StdioProxy, approver, log) -> int:
         approver.stop()
 
     signal.signal(signal.SIGINT, on_sigint)  # delivered on the main thread between Tk polls
-    worker = threading.Thread(target=proxy_thread, name="proxy-loop")
+    worker = threading.Thread(target=worker_thread, name="asyncio-loop")
     worker.start()
     approver.run()
-    proxy.stop()  # no-op if the proxy already finished
+    request_stop()  # no-op if the asyncio side already finished
     worker.join(WORKER_JOIN_TIMEOUT)
     if worker.is_alive():
-        log.error("proxy thread did not stop within %.0fs", WORKER_JOIN_TIMEOUT)
+        log.error("asyncio thread did not stop within %.0fs", WORKER_JOIN_TIMEOUT)
     return outcome["code"]
+
+
+def load_token(explicit: str | None) -> str:
+    """Gateway credential: --token, else $MCP_GUARD_TOKEN, else a persisted random token."""
+    token = explicit or os.environ.get("MCP_GUARD_TOKEN")
+    if token:
+        return token
+    if TOKEN_FILE.exists():
+        return TOKEN_FILE.read_text(encoding="utf-8").strip()
+    token = secrets.token_urlsafe(32)
+    TOKEN_FILE.write_text(token, encoding="utf-8")
+    return token
 
 
 def main() -> int:
@@ -96,6 +112,14 @@ def main() -> int:
                         help="policy: seconds to wait before deciding (simulates a human)")
     parser.add_argument("--approval-timeout", type=float, default=DEFAULT_APPROVAL_TIMEOUT,
                         help="seconds before an undecided tool call is blocked")
+    http = parser.add_argument_group("HTTP gateway (Claude Web)")
+    http.add_argument("--http", action="store_true",
+                      help="serve MCP over Streamable HTTP instead of stdio")
+    http.add_argument("--host", default="127.0.0.1", help="listen address (keep 127.0.0.1; expose via a tunnel)")
+    http.add_argument("--port", type=int, default=8765)
+    http.add_argument("--token", help=f"URL secret (default: $MCP_GUARD_TOKEN or {TOKEN_FILE.name})")
+    http.add_argument("--allow-origin", action="append", default=[],
+                      help="browser Origin to accept (requests with any other Origin are rejected)")
     args = parser.parse_args()
 
     # stdout belongs to the MCP protocol. Keep the real stream for the proxy and send
@@ -121,22 +145,34 @@ def main() -> int:
         log.error("cannot start %s approver: %s", args.approver, exc)
         return 2
 
-    proxy = StdioProxy(
-        name=args.server,
-        command=expand(cfg["command"]),
-        args=[expand(a) for a in cfg.get("args", [])],
-        approver=approver,
-        env=cfg.get("env"),
-        approval_timeout=args.approval_timeout,
-        client_out=protocol_out,
-        ignore_client_roots=bool(cfg.get("ignore_client_roots", False)),
-    )
+    command = expand(cfg["command"])
+    backend_args = [expand(a) for a in cfg.get("args", [])]
+    ignore_roots = bool(cfg.get("ignore_client_roots", False))
+
+    if args.http:
+        from app.gateway import McpGateway
+
+        token = load_token(args.token)
+        service = McpGateway(
+            server_name=args.server, command=command, args=backend_args, approver=approver,
+            token=token, env=cfg.get("env"), approval_timeout=args.approval_timeout,
+            ignore_client_roots=ignore_roots, allowed_origins=tuple(args.allow_origin),
+        )
+        log.info("Claude Web connector URL: https://<your-tunnel-host>/mcp/%s", token)
+        make_coro = lambda: service.serve(args.host, args.port)  # noqa: E731
+    else:
+        service = StdioProxy(
+            name=args.server, command=command, args=backend_args, approver=approver,
+            env=cfg.get("env"), approval_timeout=args.approval_timeout,
+            client_out=protocol_out, ignore_client_roots=ignore_roots,
+        )
+        make_coro = service.run
 
     if args.approver == "popup":
-        return run_with_popup(proxy, approver, log)
+        return run_with_popup(make_coro, service.stop, approver, log)
 
     try:
-        return asyncio.run(proxy.run())
+        return asyncio.run(make_coro())
     except KeyboardInterrupt:
         log.info("interrupted")
         return 130

@@ -110,7 +110,13 @@ class StdioProxy:
         if loop is not None and event is not None and not loop.is_closed():
             loop.call_soon_threadsafe(event.set)
 
-    async def run(self) -> int:
+    async def run(self, client_lines: "asyncio.Queue[bytes | None] | None" = None) -> int:
+        """Proxy until the client or the backend goes away.
+
+        `client_lines` lets another transport (the HTTP gateway) feed client messages;
+        None means read them from our own stdin. A None item in the queue means the
+        client disconnected.
+        """
         # On Windows, "npx" is really "npx.cmd"; shutil.which resolves that.
         exe = shutil.which(self.command) or self.command
         log.info("[%s] starting backend: %s %s", self.name, exe, " ".join(self.args))
@@ -125,8 +131,9 @@ class StdioProxy:
         )
         log.info("[%s] backend pid=%s", self.name, self.proc.pid)
 
-        client_lines: asyncio.Queue[bytes | None] = asyncio.Queue()
-        self._start_stdin_reader(asyncio.get_running_loop(), client_lines)
+        if client_lines is None:
+            client_lines = asyncio.Queue()
+            self._start_stdin_reader(asyncio.get_running_loop(), client_lines)
 
         self._loop = asyncio.get_running_loop()
         self._stop_requested = asyncio.Event()

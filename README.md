@@ -74,6 +74,49 @@ it, so the client can widen what the server may access. Backends marked `"ignore
 Prefer `uninstall` over `restore` for rollback. Claude Desktop keeps its preferences in the same file, so
 restoring an old backup also rolls those preferences back.
 
+## Claude Web integration (HTTP gateway)
+
+Claude Web can't launch local programs. It only connects to **remote** MCP servers over HTTPS ("custom
+connectors"), and those requests come from Anthropic's cloud. So MCP Guard has a second front end: a
+**Streamable HTTP gateway** that reuses the same interception, approvers, and popup.
+
+```
+Claude Web ──HTTPS──▶ Cloudflare tunnel ──▶ MCP Guard gateway (127.0.0.1:8765, app/gateway.py)
+                                                 │ one session = one guarded backend process
+                                                 ▼
+                                    StdioProxy (same tools/call interception + popup)
+                                                 ▼
+                                    filesystem MCP server (sandbox only)
+```
+
+- `POST /mcp/<token>` carries one JSON-RPC message. Requests get an SSE stream with the response. While a call waits for the popup, keep-alive comments are sent every 15 s. Notifications get `202`.
+- `initialize` creates a session (`Mcp-Session-Id` header). `DELETE` ends it. Idle sessions are cleaned up after 30 min.
+- **Security:**
+  - **Token:** a secret token in the URL path is the credential (compared in constant time; a wrong token gets 404).
+  - **Local only:** the gateway listens on `127.0.0.1` only, so the tunnel is the only way in.
+  - **Origin check:** requests with a foreign browser `Origin` header are rejected.
+- If Claude Web disconnects while a call is pending, the call is cancelled and its popup closes.
+
+Run it:
+
+```bash
+python app/main.py --server filesystem --http --port 8765
+# -> logs "Claude Web connector URL: https://<your-tunnel-host>/mcp/<token>"
+#    (token is generated once and kept in config/gateway_token.txt, which is gitignored)
+
+winget install --id Cloudflare.cloudflared       # once
+cloudflared tunnel --url http://127.0.0.1:8765   # prints https://<random>.trycloudflare.com
+```
+
+In claude.ai, go to **Settings → Connectors → Add custom connector**. Enter the URL
+`https://<random>.trycloudflare.com/mcp/<token>`, then enable the connector in a chat.
+
+To test without Claude Web: `python scripts/http_client.py http://127.0.0.1:8765/mcp/<token> read_text_file "{\"path\": \"notes.txt\"}"`
+
+**Limitations:**
+- There is no server-to-client GET stream (the spec allows this). Server-initiated notifications such as `tools/list_changed` are dropped.
+- Quick tunnels get a new hostname on every restart; a named Cloudflare tunnel keeps it stable.
+
 ## Tests
 
 ```bash
