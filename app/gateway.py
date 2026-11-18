@@ -32,6 +32,7 @@ Security:
 import asyncio
 import json
 import logging
+import re
 import secrets
 import time
 from typing import Callable
@@ -157,8 +158,23 @@ class McpGateway:
 
     # ---- app wiring ----
 
+    @web.middleware
+    async def _access_log(self, request: web.Request, handler):
+        path = re.sub(r"^/mcp/[^/]+", "/mcp/<token>", request.path)  # never log the secret
+        status = "error"
+        try:
+            response = await handler(request)
+            status = response.status
+            return response
+        except web.HTTPException as exc:
+            status = exc.status
+            raise
+        finally:
+            log.info("HTTP %s %s -> %s (ua=%s)", request.method, path, status,
+                     request.headers.get("User-Agent", "-")[:80])
+
     def make_app(self) -> web.Application:
-        app = web.Application(client_max_size=16 * 1024 * 1024)
+        app = web.Application(client_max_size=16 * 1024 * 1024, middlewares=[self._access_log])
         app.router.add_route("POST", "/mcp/{token}", self.handle_post)
         app.router.add_route("DELETE", "/mcp/{token}", self.handle_delete)
         app.router.add_route("GET", "/mcp/{token}", self.handle_get)
