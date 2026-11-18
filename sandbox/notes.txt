@@ -1,0 +1,2 @@
+MCP Guard demo file.
+If you can read this in Claude Desktop, the read_text_file call was ALLOWED by MCP Guard.

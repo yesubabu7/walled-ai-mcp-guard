@@ -1,0 +1,18 @@
+{
+  "servers": {
+    "demo": {
+      "command": "{python}",
+      "args": ["{root}/examples/demo_server.py"]
+    },
+    "demo_pinned": {
+      "command": "{python}",
+      "args": ["{root}/examples/demo_server.py"],
+      "ignore_client_roots": true
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "{root}/sandbox"],
+      "ignore_client_roots": true
+    }
+  }
+}

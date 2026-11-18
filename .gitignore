@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+logs/*.log
+# Demo sandbox: keep the sample file, never commit anything else (e.g. the dummy .env)
+sandbox/*
+!sandbox/notes.txt
+.pytest_cache/
+config/gateway_token.txt
+# Claude Desktop config backups contain account ids and device names
+backups/
