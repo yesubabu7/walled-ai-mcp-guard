@@ -5,7 +5,9 @@ and your MCP servers. It holds every tool call in an always-on-top popup until y
 
 ![Allow/Block popups for three simultaneous tool calls](docs/popups.png)
 
-> **Demo video:** _add link here_ · Built for the Walled AI take-home assignment.
+> **Demo video (3 min):** https://youtu.be/179yX5TBsgM
+> Shows Allow and Block in Claude Desktop and claude.ai, three simultaneous requests, and the test suite.
+> Built for the Walled AI take-home assignment.
 
 ---
 
